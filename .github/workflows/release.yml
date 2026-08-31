@@ -1,12 +1,26 @@
 name: Release
 
+# Both, and the second is the one that matters. A tag pushed with git fires the first; a
+# release created from the GitHub side fires the second and not the first. Only one of those
+# also starts image.yml, which listens for `release: published` — GitHub does not trigger
+# workflows from events a GITHUB_TOKEN created, so a release this workflow makes for itself
+# publishes manifests and no image. Listening for both means the release can be created the
+# way that does start the image build, and this still runs.
 on:
   push:
     tags: ['v*']
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
   contents: write
+
+# Both triggers can fire for one version. The upload overwrites rather than duplicating, so
+# the second run is harmless; this just stops the two racing to write the same asset.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   manifests:
