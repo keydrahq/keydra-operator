@@ -17,19 +17,18 @@ on:
       - 'Containerfile'
       - '.containerignore'
       - '.github/workflows/image.yml'
+  # No path filter here, and that is the price of the tag trigger below rather than an
+  # oversight. `paths` applies to every ref in the block, and a tag pushed to a commit
+  # already on main carries no changed files — so a filtered block would match nothing and
+  # the release would silently not publish, which looks exactly like success. Building on
+  # every merge to main costs a few minutes against a warm Maven cache; a version that
+  # quietly did not ship costs an afternoon of looking for it.
   push:
     branches: [main]
-    paths:
-      - 'src/**'
-      - 'pom.xml'
-      - '.mvn/**'
-      - 'Containerfile'
-      - '.containerignore'
-      - '.github/workflows/image.yml'
-  # A release is a version. `release` rather than `push: tags`, because a path filter and a
-  # tag trigger cannot share one push block: pushing a tag to a commit already on main
-  # carries no changed files, so the filter would match nothing and the release would
-  # silently not publish — a failure that looks exactly like success.
+    tags: ['v*']
+  # And from the GitHub side too, for a release published through the web form. Only one of
+  # the two fires in that case: GitHub does not trigger workflows from a tag a GITHUB_TOKEN
+  # created, so a release made by release.yml would otherwise reach nothing here.
   release:
     types: [published]
   # The base images are rebuilt from tags Red Hat republishes, so the same source produces a
@@ -147,8 +146,16 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          if [ -n "${RELEASE_TAG:-}" ]; then
-            tags=("${RELEASE_TAG#v}" latest)
+          # Either road to a version: a tag pushed with git, or a release published from the
+          # web form. Both have to end at the same two tags, because which one somebody used
+          # is not a thing the registry should be able to tell.
+          version=""
+          case "${GITHUB_REF}" in
+            refs/tags/v*) version="${GITHUB_REF#refs/tags/v}" ;;
+          esac
+          [ -n "${version}" ] || version="${RELEASE_TAG#v}"
+          if [ -n "${version}" ]; then
+            tags=("${version}" latest)
           else
             tags=(main)
           fi
