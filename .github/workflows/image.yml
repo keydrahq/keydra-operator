@@ -1,56 +1,161 @@
 name: Image
 
+# The manager, as quay.io/keydrahq/keydra-operator.
+#
+# ci.yml answers whether the code is right. This answers a different question and one nothing
+# else asks: whether the thing that ships was built at all. What that catches lives between
+# the source and the image — a base that stopped carrying a program the healthcheck names, a
+# build that runs out of file descriptors before it runs out of anything else — and every
+# test goes on passing while it happens.
+
 on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'pom.xml'
+      - '.mvn/**'
+      - 'Containerfile'
+      - '.containerignore'
+      - '.github/workflows/image.yml'
   push:
     branches: [main]
-    tags: ['v*']
+    paths:
+      - 'src/**'
+      - 'pom.xml'
+      - '.mvn/**'
+      - 'Containerfile'
+      - '.containerignore'
+      - '.github/workflows/image.yml'
+  # A release is a version. `release` rather than `push: tags`, because a path filter and a
+  # tag trigger cannot share one push block: pushing a tag to a commit already on main
+  # carries no changed files, so the filter would match nothing and the release would
+  # silently not publish — a failure that looks exactly like success.
+  release:
+    types: [published]
+  # The base images are rebuilt from tags Red Hat republishes, so the same source produces a
+  # patched image a week later. This runs in every cluster that installs Keydra, whether or
+  # not anybody uses what they installed it for, so found and not shipped is the same as not
+  # found.
+  schedule:
+    - cron: '0 7 * * 1'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: image-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  REGISTRY: quay.io
+  REPOSITORY: quay.io/keydrahq/keydra-operator
 
 jobs:
   image:
-    name: Build and push the manager
+    name: Build the image
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
-      # A tag publishes its version and moves `latest`; a push to main publishes `main` only.
-      # `latest` following main would mean an installation that pinned nothing tracking whatever
-      # was merged an hour ago, which is a thing an operator must never do to a cluster.
-      - name: Work out the tags
-        id: tags
+      # The Containerfile puts dependency resolution in its own layer so a source-only
+      # rebuild reuses it. That works on a developer's machine and never here: a runner
+      # arrives with no layers at all, so every run would fetch the whole repository again.
+      # The cache belongs to the runner and the build borrows it; what `-v` mounts into a
+      # build is not in the image, so nothing about what ships changes.
+      - name: Cache the Maven repository
+        uses: actions/cache@v6
+        with:
+          path: ~/.m2/repository
+          key: m2-image-${{ hashFiles('pom.xml') }}
+          restore-keys: m2-image-
+
+      # --format docker rather than the OCI default, which is the only format with somewhere
+      # to put a HEALTHCHECK. The Containerfile carries one and Podman drops it with a
+      # warning; the same flag whether the image is pushed or not, so that what CI builds is
+      # what CI would publish.
+      #
+      # --ulimit is load-bearing and is the reason this is a podman invocation rather than a
+      # build action. Rootless Podman passes the shell's file-descriptor limit into the
+      # build, and javac against this many jars exhausts it: the failure is "Too many open
+      # files" against some jar, followed by a page of "cannot find symbol" for every class
+      # in the module, which reads like a broken source tree and is not one.
+      #
+      # /root/.m2 because the build stage runs as root — it has to, since the base runs as
+      # 185 and /build would not be writable otherwise.
+      #
+      # amd64 only, deliberately, and it is the same answer the application's own images
+      # give. An operator that shipped for an architecture the thing it installs does not is
+      # an operator that installs a CrashLoopBackOff. When Keydra ships arm64, this follows.
+      - name: Build
+        run: |
+          mkdir -p "$HOME/.m2/repository"
+          podman build --format docker --ulimit nofile=16384:16384 \
+            -v "$HOME/.m2/repository:/root/.m2/repository:rw" \
+            -t localhost/keydra-operator:ci -f Containerfile .
+
+      # Not a running manager: that needs an API server, and standing one up belongs with the
+      # end-to-end test rather than here. These are the two things about the image itself
+      # that have failed before and would otherwise fail in somebody's cluster.
+      - name: Ask the image the two questions it can answer without a cluster
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            version="${GITHUB_REF#refs/tags/v}"
-            echo "tags=${version} latest" >> "${GITHUB_OUTPUT}"
-          else
-            echo "tags=main" >> "${GITHUB_OUTPUT}"
+
+          # The HEALTHCHECK names curl. UBI's runtime variant carries it and its minimal
+          # cousin does not, so a base image change is exactly how this stops being true —
+          # and a healthcheck whose program is missing reports unhealthy for ever.
+          podman run --rm --entrypoint sh localhost/keydra-operator:ci \
+            -c 'command -v curl >/dev/null' \
+            || { echo "::error::the base no longer carries curl, which HEALTHCHECK names"; exit 1; }
+
+          # The ENTRYPOINT names quarkus-run.jar, and the COPY that puts it there is four
+          # lines that can each go wrong quietly.
+          podman run --rm --entrypoint sh localhost/keydra-operator:ci \
+            -c 'test -f /app/quarkus-run.jar && test -d /app/lib && test -d /app/quarkus' \
+            || { echo "::error::the application layout is not what ENTRYPOINT expects"; exit 1; }
+
+          echo "  the image is built and laid out the way it is started"
+
+      - name: Sign in to the registry
+        if: >-
+          (github.event_name == 'push' || github.event_name == 'release'
+           || github.event_name == 'schedule')
+          && github.repository == 'keydrahq/keydra-operator'
+        env:
+          QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
+        run: |
+          if [ -z "${QUAY_USERNAME}" ] || [ -z "${QUAY_TOKEN}" ]; then
+            echo "::error::QUAY_USERNAME and QUAY_TOKEN are not set. Add the keydrahq robot" \
+                 "account's name and token as repository secrets, and give it write on" \
+                 "quay.io/keydrahq/keydra-operator."
+            exit 1
           fi
+          podman login "${REGISTRY}" --username "${QUAY_USERNAME}" --password-stdin <<< "${QUAY_TOKEN}"
 
-      - name: Build
-        id: build
-        uses: redhat-actions/buildah-build@v2
-        with:
-          image: keydra-operator
-          tags: ${{ steps.tags.outputs.tags }}
-          containerfiles: ./Containerfile
-          # An operator runs on whatever the cluster is, and an ARM cluster is an ordinary
-          # thing now. The manager is a JVM either way; only the base image differs.
-          platforms: linux/amd64,linux/arm64
-
-      - name: Push to Quay
-        if: github.event_name != 'pull_request'
-        uses: redhat-actions/push-to-registry@v2
-        with:
-          image: ${{ steps.build.outputs.image }}
-          tags: ${{ steps.build.outputs.tags }}
-          registry: quay.io/keydrahq
-          username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_TOKEN }}
+      # refs/tags/v0.0.1 -> :0.0.1 and :latest;  main -> :main.
+      #
+      # `latest` moves on a release and not on a merge, because a person pulling by name is
+      # not asking for whatever built most recently — and for an operator that person is a
+      # cluster, applying it unattended.
+      - name: Push
+        if: >-
+          (github.event_name == 'push' || github.event_name == 'release'
+           || github.event_name == 'schedule')
+          && github.repository == 'keydrahq/keydra-operator'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          if [ -n "${RELEASE_TAG:-}" ]; then
+            tags=("${RELEASE_TAG#v}" latest)
+          else
+            tags=(main)
+          fi
+          for tag in "${tags[@]}"; do
+            podman tag localhost/keydra-operator:ci "${REPOSITORY}:${tag}"
+            podman push "${REPOSITORY}:${tag}"
+            echo "pushed ${REPOSITORY}:${tag}" >> "${GITHUB_STEP_SUMMARY}"
+          done
+          digest=$(podman inspect --format '{{index .RepoDigests 0}}' "${REPOSITORY}:${tags[0]}")
+          echo "digest: \`${digest}\`" >> "${GITHUB_STEP_SUMMARY}"

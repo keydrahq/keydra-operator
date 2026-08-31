@@ -1,6 +1,12 @@
 # The operator's manager.
 #
-#   podman build -t keydra-operator:dev -f Containerfile .
+#   podman build --ulimit nofile=16384:16384 -t keydra-operator:dev -f Containerfile .
+#
+# The ulimit is not decoration. Rootless Podman passes the shell's own file-descriptor limit
+# into the build, and javac compiling against this many jars runs out of descriptors long
+# before it runs out of anything else. The error it gives is "Too many open files" against a
+# random jar, followed by a page of "cannot find symbol" for every class in the module — which
+# reads like a broken source tree and is not one.
 #
 # Small on purpose and for a reason beyond taste: this runs in every cluster that installs
 # Keydra, whether or not anybody uses the parts of it they installed it for, and it holds
