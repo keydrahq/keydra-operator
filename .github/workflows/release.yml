@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  manifests:
+    name: Attach the manifests to the release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Generate
+        run: ./mvnw -B -ntp package -DskipTests
+
+      # Two files rather than one, because they are installed at different times by different
+      # people. CRDs are cluster-wide and are applied once by whoever owns the cluster; the
+      # manager is a Deployment somebody upgrades. Handing over one file makes the second
+      # operation look like the first.
+      - name: Assemble
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cat target/kubernetes/keydras.keydra.io-v1.yml > dist/crds.yaml
+          echo '---' >> dist/crds.yaml
+          cat target/kubernetes/keydraconnections.keydra.io-v1.yml >> dist/crds.yaml
+          # Everything except the CRDs: the namespace, the account, the roles and the manager.
+          python3 scripts/split-manifests.py target/kubernetes/kubernetes.yml dist/operator.yaml
+          tar -czf dist/bundle.tar.gz -C target/bundle keydra-operator
+
+      - name: Attach
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/crds.yaml
+            dist/operator.yaml
+            dist/bundle.tar.gz

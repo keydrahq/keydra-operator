@@ -1,0 +1,226 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>io.keydra</groupId>
+    <artifactId>keydra-operator</artifactId>
+    <version>0.0.1</version>
+    <packaging>quarkus</packaging>
+    <name>Keydra Operator</name>
+    <description>Kubernetes operator for Keydra — installs an instance, and registers the targets it manages</description>
+
+    <properties>
+        <compiler-plugin.version>3.15.0</compiler-plugin.version>
+        <maven.compiler.release>21</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
+        <!-- The community platform rather than com.redhat.quarkus.platform, which the backend
+             uses. The Red Hat build ships no operator-sdk extension, and josdk pins the Quarkus
+             it was built against: 7.8.0 is 3.38.0. Taking the Red Hat BOM here would mean
+             resolving josdk against a Quarkus it has never seen. -->
+        <quarkus.platform.group-id>io.quarkus.platform</quarkus.platform.group-id>
+        <quarkus.platform.artifact-id>quarkus-bom</quarkus.platform.artifact-id>
+        <quarkus.platform.version>3.38.0</quarkus.platform.version>
+        <quarkus-operator-sdk.version>7.8.0</quarkus-operator-sdk.version>
+
+        <surefire-plugin.version>3.5.4</surefire-plugin.version>
+        <assertj.version>3.27.6</assertj.version>
+        <!-- Pinned to the client the platform resolves, and checked by KubernetesClientVersionTest
+             rather than trusted: the annotations and the generator that reads them are one
+             artifact set, and a version skew between them fails by producing a CRD that is
+             quietly missing its validation rules. -->
+        <fabric8.version>7.8.0</fabric8.version>
+        <wiremock.version>3.13.1</wiremock.version>
+        <skipITs>true</skipITs>
+
+        <spotless-plugin.version>3.10.0</spotless-plugin.version>
+        <google-java-format.version>1.36.1</google-java-format.version>
+
+        <!-- What `make bundle` stamps into the CSV, and what the manager image is tagged with.
+             Kept here so a release bumps one file. -->
+        <keydra.operator.image>quay.io/keydrahq/keydra-operator</keydra.operator.image>
+        <!-- The Keydra a CR gets when its spec names no tag. The operator's own version and
+             the application's move independently — an operator release that only fixes a
+             reconciler does not make a new Keydra. -->
+        <keydra.default.version>0.0.1</keydra.default.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>${quarkus.platform.group-id}</groupId>
+                <artifactId>${quarkus.platform.artifact-id}</artifactId>
+                <version>${quarkus.platform.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>io.quarkiverse.operatorsdk</groupId>
+                <artifactId>quarkus-operator-sdk-bom</artifactId>
+                <version>${quarkus-operator-sdk.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.quarkiverse.operatorsdk</groupId>
+            <artifactId>quarkus-operator-sdk</artifactId>
+        </dependency>
+
+        <!-- Generates the OLM bundle — CSV, CRDs and annotations — into target/bundle at
+             package time. That directory is what a PR to community-operators carries, and
+             generating it means the CSV's owned CRDs cannot disagree with the CRDs the
+             build produced from the same classes. -->
+        <dependency>
+            <groupId>io.quarkiverse.operatorsdk</groupId>
+            <artifactId>quarkus-operator-sdk-bundle-generator</artifactId>
+        </dependency>
+
+        <!-- The Route and the ServiceMonitor are deliberately NOT typed. Taking
+             openshift-client and prometheus-model for two objects would put two model trees
+             and their transitive weight into an image whose whole job is small, and it would
+             not buy what it looks like it buys: the classes compile whether or not the
+             cluster has the CRD, so the presence check has to happen at runtime anyway.
+             GenericKubernetesResource does the same work with the check where it belongs. -->
+
+        <!-- Required, Min, Max and ValidationRule — the annotations the CRD generator reads.
+             They are not pulled in by the extension: the generator runs in the deployment
+             module, and what a spec class is annotated with is a compile-time concern of this
+             one. -->
+        <dependency>
+            <groupId>io.fabric8</groupId>
+            <artifactId>generator-annotations</artifactId>
+            <version>${fabric8.version}</version>
+        </dependency>
+
+        <!-- KeydraConnection reconciles against Keydra's HTTP API rather than against the
+             API server, so this one reconciler needs a client of its own. -->
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-rest-client-jackson</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-hibernate-validator</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-junit5</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- A mock API server, so the dependent resources can be asserted against what they
+             actually produce rather than against a reading of their source. -->
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-test-kubernetes-client</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.quarkus</groupId>
+            <artifactId>quarkus-junit5-mockito</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.assertj</groupId>
+            <artifactId>assertj-core</artifactId>
+            <version>${assertj.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.rest-assured</groupId>
+            <artifactId>rest-assured</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.wiremock</groupId>
+            <artifactId>wiremock</artifactId>
+            <version>${wiremock.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>${quarkus.platform.group-id}</groupId>
+                <artifactId>quarkus-maven-plugin</artifactId>
+                <version>${quarkus.platform.version}</version>
+                <extensions>true</extensions>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>build</goal>
+                            <goal>generate-code</goal>
+                            <goal>generate-code-tests</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>${compiler-plugin.version}</version>
+                <configuration>
+                    <compilerArgs>
+                        <arg>-parameters</arg>
+                    </compilerArgs>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>${surefire-plugin.version}</version>
+                <configuration>
+                    <systemPropertyVariables>
+                        <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
+                        <maven.home>${maven.home}</maven.home>
+                    </systemPropertyVariables>
+                </configuration>
+            </plugin>
+
+            <!-- The same formatter the backend uses, bound the same way: format drift fails
+                 the build rather than being found in review. -->
+            <plugin>
+                <groupId>com.diffplug.spotless</groupId>
+                <artifactId>spotless-maven-plugin</artifactId>
+                <version>${spotless-plugin.version}</version>
+                <configuration>
+                    <java>
+                        <googleJavaFormat>
+                            <version>${google-java-format.version}</version>
+                            <style>AOSP</style>
+                        </googleJavaFormat>
+                        <removeUnusedImports/>
+                    </java>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                        <phase>validate</phase>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <profile>
+            <id>native</id>
+            <activation>
+                <property>
+                    <name>native</name>
+                </property>
+            </activation>
+            <properties>
+                <skipITs>false</skipITs>
+                <quarkus.native.enabled>true</quarkus.native.enabled>
+            </properties>
+        </profile>
+    </profiles>
+</project>

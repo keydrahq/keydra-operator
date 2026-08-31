@@ -1,0 +1,56 @@
+name: Image
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: Build and push the manager
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # A tag publishes its version and moves `latest`; a push to main publishes `main` only.
+      # `latest` following main would mean an installation that pinned nothing tracking whatever
+      # was merged an hour ago, which is a thing an operator must never do to a cluster.
+      - name: Work out the tags
+        id: tags
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+            echo "tags=${version} latest" >> "${GITHUB_OUTPUT}"
+          else
+            echo "tags=main" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Build
+        id: build
+        uses: redhat-actions/buildah-build@v2
+        with:
+          image: keydra-operator
+          tags: ${{ steps.tags.outputs.tags }}
+          containerfiles: ./Containerfile
+          # An operator runs on whatever the cluster is, and an ARM cluster is an ordinary
+          # thing now. The manager is a JVM either way; only the base image differs.
+          platforms: linux/amd64,linux/arm64
+
+      - name: Push to Quay
+        if: github.event_name != 'pull_request'
+        uses: redhat-actions/push-to-registry@v2
+        with:
+          image: ${{ steps.build.outputs.image }}
+          tags: ${{ steps.build.outputs.tags }}
+          registry: quay.io/keydrahq
+          username: ${{ secrets.QUAY_USERNAME }}
+          password: ${{ secrets.QUAY_TOKEN }}
